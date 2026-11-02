@@ -4,7 +4,7 @@ import time
 import pytest
 
 from PyQt6.QtCore import QByteArray, QObject, QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import (QColor, QFontMetrics, QImage, QMouseEvent, QPainter,
+from PyQt6.QtGui import (QColor, QImage, QMouseEvent, QPainter,
                          QPixmap)
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import QApplication, QLabel
@@ -879,7 +879,7 @@ class TestWindow:
         assert not hasattr(window, "show_popover")
         assert not hasattr(app, "NotesPopover")
 
-    def test_a_huge_changelog_stops_at_the_cap_and_says_so(self, window):
+    def test_expanded_notes_show_the_whole_changelog(self, window):
         window._model.set_info(
             0, "d", "short", "2026-01-01",
             "\n".join(f"line {i}" for i in range(30)),
@@ -887,11 +887,11 @@ class TestWindow:
         d = window._delegate
         window._on_more_requested(0)
         lay = d._layout(0, window._model.item(0), 900)
-        assert lay["hint_txt"] == "… 17 more lines"
-        spacing = QFontMetrics(d._f_text).lineSpacing()
-        assert lay["notes"].height() <= (
-            app.PackageDelegate.NOTES_LINES * spacing + 8)
-        assert lay["hint"].top() >= lay["notes"].top()
+        assert lay["hint_txt"] == ""
+        assert lay["hint"].isNull()
+        plain = lay["notes_doc"].toPlainText()
+        assert "line 0" in plain
+        assert "line 29" in plain
 
     def test_the_fetcher_swaps_a_guessed_repo_for_the_real_one(self, window):
         # checkupdates prints no repo, so every repo row starts out

@@ -2717,7 +2717,7 @@ class InfoFetcher(QThread):
             )
             self._cache[pkg["name"]] = {
                 "desc": desc, "notes": notes, "date": date,
-                "full": full[:6000], "source": source,
+                "full": full, "source": source,
                 "source_url": source_url,
                 "version": pkg["new"], "ts": now,
             }
@@ -4761,11 +4761,6 @@ class PackageDelegate(QStyledItemDelegate):
     more_requested = pyqtSignal(int)    # show more / less
     action_requested = pyqtSignal(str)  # retry / install-anyway for pkg
 
-    # How many lines an unfolded row shows before the rest is left to the
-    # package page: release notes can run to a hundred lines, and a row
-    # taller than the window helps nobody.
-    NOTES_LINES = 14
-
     RAIL = 28       # checkbox / status icon column
     PAD = 16        # card inner padding (horizontal, 4u)
     PTOP = 10       # card inner padding top
@@ -4934,10 +4929,8 @@ class PackageDelegate(QStyledItemDelegate):
 
         # ── Row 4 · what's new: one line, or the whole thing unfolded ──────
         # "Show more" unfolds the full notes *in the row*: the card grows
-        # to hold them and "Show less" folds it back (see toggle_notes).
-        # Nothing is cut off without saying so: past NOTES_LINES the block
-        # ends on a muted "… N more lines" and leaves the rest to the
-        # package page the row already links to.
+        # to hold all of them and "Show less" folds it back (see
+        # toggle_notes). Nothing is cut off: expanded means everything.
         full = (item["full"] or "").strip()
         notes = (item["notes"] or "").strip()
         unfold_txt = full or notes
@@ -4975,21 +4968,11 @@ class PackageDelegate(QStyledItemDelegate):
         notes_w = max(60, cw - (first_line_res + 24 if first_line_res else 0))
         hint_txt = ""
         if unfolded:
-            lines = unfold_txt.splitlines() or [""]
-            if len(lines) > self.NOTES_LINES:
-                keep = self.NOTES_LINES - 1
-                body = "\n".join(lines[:keep])
-                rest = len(lines) - keep
-                hint_txt = f"… {rest} more line{'s' if rest != 1 else ''}"
-            else:
-                body = unfold_txt
             notes_doc = self._doc(row, "notes_full",
-                                  prefix_html + html.escape(body)
+                                  prefix_html + html.escape(unfold_txt)
                                   .replace("\n", "<br>"), notes_w,
                                   self._f_text, True, rev)
             h_block = max(h_notes, int(notes_doc.size().height()) + 2)
-            if hint_txt:
-                h_block += self.GAP + h_notes
         else:
             shown = (notes[:_SNIPPET_LEN].rstrip() + "…"
                      if len(notes) > _SNIPPET_LEN else notes)
