@@ -179,6 +179,94 @@ class TestObsolete:
         assert app.obsolete_conflict_culprits("all good", ["a"]) == []
 
 
+class TestSkipFailed:
+    """Skipping the packages a failure names must leave the rest."""
+
+    OUT = (":: installing opencv (5.1.0-2) breaks dependency "
+           "'opencv<5.1' required by gaze-bin\n"
+           "error: failed to prepare transaction "
+           "(could not satisfy dependencies)")
+
+    def test_installing_package_is_the_one_to_skip(self):
+        assert app.extract_dep_conflict_packages(
+            self.OUT, ["opencv", "konsole", "kpackage"]) == ["opencv"]
+
+    def test_blocker_is_not_skipped(self):
+        # gaze-bin blocks the upgrade but is not being updated: skipping
+        # it would change nothing. The new opencv is what must wait.
+        assert "gaze-bin" not in app.extract_dep_conflict_packages(
+            self.OUT, ["opencv", "gaze-bin"])
+
+    def test_multiple_conflicts_keep_output_order(self):
+        out = (":: installing b-pkg (2) breaks dependency 'x' required by q\n"
+               ":: installing a-pkg (2) breaks dependency 'y' required by r\n")
+        assert app.extract_dep_conflict_packages(
+            out, ["a-pkg", "b-pkg", "c-pkg"]) == ["b-pkg", "a-pkg"]
+
+    def test_unresolvable_dependency_names_its_package(self):
+        out = ('warning: cannot resolve "libfoo>=2", a dependency of "bar"\n'
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        assert app.extract_dep_conflict_packages(
+            out, ["bar", "baz"]) == ["bar"]
+
+    def test_no_candidate_named_means_nothing_to_skip(self):
+        assert app.extract_dep_conflict_packages(self.OUT, ["konsole"]) == []
+        assert app.extract_dep_conflict_packages("", ["opencv"]) == []
+        assert app.extract_dep_conflict_packages("all good", ["opencv"]) == []
+
+    NVIDIA = (":: installing nvidia-utils (620.73.04-1) breaks dependency "
+              "'nvidia-utils=620.70.06' required by lib32-nvidia-utils\n"
+              "error: failed to prepare transaction "
+              "(could not satisfy dependencies)")
+
+    def test_conflict_pairs_name_breaker_and_requirer(self):
+        assert app.extract_dep_conflict_pairs(self.NVIDIA) == [
+            ("nvidia-utils", "lib32-nvidia-utils")]
+        assert app.extract_dep_conflict_pairs(self.OUT) == [
+            ("opencv", "gaze-bin")]
+        assert app.extract_dep_conflict_pairs("all good") == []
+        assert app.extract_dep_conflict_pairs("") == []
+
+    def test_skip_set_includes_selected_requirer(self):
+        # Both halves of a version-locked pair were selected: neither can
+        # move alone, so both wait.
+        assert app.dep_conflict_skip_packages(
+            self.NVIDIA, ["nvidia-utils", "lib32-nvidia-utils", "konsole"]
+        ) == ["nvidia-utils", "lib32-nvidia-utils"]
+
+    def test_skip_set_excludes_unselected_requirer(self):
+        # The requirer is only installed, not updating: only the new
+        # package waits (it can be updated together with it later).
+        assert app.dep_conflict_skip_packages(
+            self.NVIDIA, ["nvidia-utils", "konsole"]) == ["nvidia-utils"]
+
+    SI = ("Repository      : extra\n"
+          "Name            : konsole\n"
+          "Version         : 2-1\n"
+          "Depends On      : nvidia-utils=620.73.04  glibc\n"
+          "                  libglvnd\n"
+          "\n"
+          "Repository      : extra\n"
+          "Name            : kpackage\n"
+          "Version         : 2-1\n"
+          "Depends On      : glibc\n")
+
+    def test_sync_names_and_dependents(self):
+        assert app.sync_package_names(self.SI) == {"konsole", "kpackage"}
+        assert app.sync_dependents(self.SI, {"nvidia-utils"}) == ["konsole"]
+        assert app.sync_dependents(self.SI, {"glibc"}) == [
+            "konsole", "kpackage"]
+        assert app.sync_dependents("", {"nvidia-utils"}) == []
+
+    def test_remaining_after_skip(self):
+        assert app.remaining_after_skip(
+            ["a", "b", "c"], ["b"]) == ["a", "c"]
+        assert app.remaining_after_skip(["a"], ["a"]) == []
+        assert app.remaining_after_skip(["a", "b"], ["nope"]) == ["a", "b"]
+        assert app.remaining_after_skip(["a", "b"], []) == ["a", "b"]
+
+
 class TestLogNoise:
     def test_noise(self):
         assert app.is_log_noise("[##################] 100%")
@@ -275,6 +363,18 @@ class TestRunnerCommands:
         r = app.UpdateRunner(None, ["fzf"])
         assert r._cmd[:4] == ["sudo", "-A", "pacman", "-Sy"]
         assert "SUDO_ASKPASS" in r._child_env()
+        r._cleanup()
+
+    def test_ignore_flags_reach_pacman_and_helper(self, monkeypatch):
+        monkeypatch.setattr(app.shutil, "which", lambda n: n == "sudo")
+        r = app.UpdateRunner(None, ["fzf", "konsole"], ignore=["konsole"])
+        assert "--ignore" in r._cmd
+        assert r._cmd[r._cmd.index("--ignore") + 1] == "konsole"
+        r._cleanup()
+        r = app.UpdateRunner("paru", ["fzf"], ignore=["fzf", "konsole"])
+        pairs = [r._cmd[i + 1] for i, a in enumerate(r._cmd)
+                 if a == "--ignore"]
+        assert pairs == ["fzf", "konsole"]
         r._cleanup()
 
     def test_full_upgrade_unchanged(self, monkeypatch):
