@@ -1401,3 +1401,24 @@ class TestGetObsoletePackages:
         monkeypatch.setattr(app, "_run", fake_run)
         assert app.get_obsolete_packages() == []
         assert [c for c in calls if c[:2] == ["pacman", "-Qi"]] == []
+
+
+class TestStripAnsi:
+    def test_strips_csi_color_codes(self):
+        assert app.strip_ansi("\x1b[31mred\x1b[0m") == "red"
+
+    def test_strips_osc8_hyperlink_bel(self):
+        # gcc -fdiagnostics-urls: hyperlink wraps the URL text
+        s = "\x1b]8;;https://gcc.gnu.org/onlinedocs\x07URL\x1b]8;;\x07"
+        assert app.strip_ansi(s) == "URL"
+
+    def test_strips_osc8_hyperlink_st(self):
+        s = "\x1b]8;;https://example.com\x1b\\text\x1b]8;;\x1b\\"
+        assert app.strip_ansi(s) == "text"
+
+    def test_plain_text_unchanged(self):
+        assert app.strip_ansi("no escapes here") == "no escapes here"
+
+    def test_empty(self):
+        assert app.strip_ansi("") == ""
+        assert app.strip_ansi(None) == ""

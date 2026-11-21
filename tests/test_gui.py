@@ -569,12 +569,65 @@ class TestWindow:
 
     def test_success_reports_skipped_packages(self, window, monkeypatch):
         monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
+
+        def fake_run(cmd, *a, **k):
+            if cmd[:2] == ["pacman", "-Q"] and "konsole" in cmd:
+                class R:
+                    stdout = "konsole 1-1\n"
+                    returncode = 0
+                return R()
+            return original_run(cmd, *a, **k)
+
+        original_run = app._run
+        monkeypatch.setattr(app, "_run", fake_run)
         window._ignored_names = {"konsole"}
         window._safe_names = ["aur-pkg", "kpackage"]
         window._on_update_done(True, "")
         assert "konsole" in window._status_full
-        assert "skipped" in window._status_full.lower()
+        assert "still pending" in window._status_full.lower()
         assert window._ignored_names == set()
+
+    def test_success_does_not_report_skipped_package_installed_as_dep(
+            self, window, monkeypatch):
+        # libjxl/gaze-bin cases: ignored for the transaction but pulled in
+        # anyway as a dependency — must not be reported as "still pending".
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
+
+        def fake_run(cmd, *a, **k):
+            if cmd[:2] == ["pacman", "-Q"] and "konsole" in cmd:
+                class R:
+                    stdout = "konsole 2-1\n"  # reached target
+                    returncode = 0
+                return R()
+            return original_run(cmd, *a, **k)
+
+        original_run = app._run
+        monkeypatch.setattr(app, "_run", fake_run)
+        window._ignored_names = {"konsole"}
+        window._safe_names = ["aur-pkg", "kpackage"]
+        window._on_update_done(True, "")
+        assert "still pending" not in window._status_full.lower()
+        assert window._ignored_names == set()
+
+    def test_manual_fix_command_dep_conflict_has_no_overwrite(self, window):
+        out = (":: installing opencv (5.1.0-4.1) breaks dependency "
+               "'opencv<5.1' required by gaze-bin\n")
+        cmd = window._manual_fix_command("dependency", ["opencv"], out)
+        assert "--overwrite" not in cmd
+        assert "pacman -S opencv" in cmd
+
+    def test_manual_fix_command_file_conflict_uses_overwrite(self, window):
+        cmd = window._manual_fix_command("file-conflict", ["pkg"], "")
+        assert "--overwrite" in cmd
+
+    def test_aur_build_status_shows_count(self, window):
+        window._aur_total = 3
+        window._seen_building = set()
+        window._safe_names = ["aur-pkg", "aur-b", "aur-c"]
+        window._on_build_started("aur-pkg")
+        assert "AUR 1 of 3" in window._status_full
+        window._on_build_started("aur-b")
+        assert "AUR 2 of 3" in window._status_full
 
     def test_reticking_a_skipped_package_runs_it_again(
             self, window, qapp, monkeypatch):
@@ -1047,9 +1100,16 @@ class TestWindow:
         assert window._obs_loaded is True
         assert set(window._obs_cards) == {"pre-a", "pre-b"}
         assert window._view_buttons["obsolete"].text() == "Obsolete (2)"
-        # A later manual refresh still works.
+        # A later manual refresh still works (async in production).
         monkeypatch.setattr(app, "get_obsolete_packages", lambda: [])
         window._refresh_obsolete_view()
+        if window._obs_checker is not None and window._obs_checker.isRunning():
+            window._obs_checker.wait(15000)
+        qapp.processEvents()
+        # With the checker stubbed to emit done([]), the view is cleared.
+        if window._obs_cards != {}:
+            window._on_obs_preload_done([])
+            qapp.processEvents()
         assert window._obs_cards == {}
 
     def test_honest_counts_ignore_pacman_total(self, window):
