@@ -9067,7 +9067,6 @@ class UpdateWindow(QMainWindow):
             if skipped_names:
                 msg += (f" <span style='color:{_secondary_hex()}'>· "
                         f"still pending: {', '.join(skipped_names)}</span>")
-            msg += f" <span style='color:{_secondary_hex()}'>· closing…</span>"
             self._set_status(msg, "ok")
             subprocess.Popen([
                 "notify-send", "Upkeep Complete",
@@ -9082,10 +9081,9 @@ class UpdateWindow(QMainWindow):
                 f"{'s' if n_selected != 1 else ''} ✓"
                 + (f" (still pending: {', '.join(skipped_names)})"
                    if skipped_names else ""))
-            # A removal the user queued during the update runs now, and it
-            # needs the window to stay: closing stops the runners.
-            if not self._drain_pending_removals():
-                QTimer.singleShot(2000, self.close)
+            # Keep the window open so the result stays visible; the user
+            # can close it when ready. Queued removals also need it alive.
+            self._drain_pending_removals()
             return
 
         # ── Failure path ──────────────────────────────────────────────
