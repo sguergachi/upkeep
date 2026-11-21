@@ -1392,6 +1392,86 @@ def obsolete_conflict_culprits(output: str, obsolete: list[str]) -> list[str]:
     return []
 
 
+def extract_dep_conflict_packages(output: str,
+                                  candidates: list[str]) -> list[str]:
+    """Packages from `candidates` whose upgrade a dependency conflict refused.
+
+    Parses pacman lines like:
+        ":: installing opencv (5.1.0-2) breaks dependency 'opencv<5.1'
+         required by gaze-bin"
+        "warning: cannot resolve "libfoo>=2", a dependency of "bar""
+        ":: foo and bar are in conflict"
+
+    Only the package being *installed* is named: the "required by" package
+    is an installed blocker, not an update, so skipping it would change
+    nothing — the new version is the one that has to wait. Returns the
+    matches in output order, de-duplicated; [] when no candidate is named.
+    """
+    cand = set(candidates or [])
+    if not cand or not output:
+        return []
+    found: list[str] = []
+
+    def add(name: str) -> None:
+        if name in cand and name not in found:
+            found.append(name)
+
+    for line in output.splitlines():
+        m = re.search(r"installing\s+(\S+)\s*\(", line)
+        if m and "breaks dependency" in line:
+            add(m.group(1))
+            continue
+        m = re.search(r"cannot resolve\s+\"[^\"]+\",\s*a dependency of\s+"
+                      r"[\"']?([\w\-+.]+)[\"']?", line)
+        if m:
+            add(m.group(1))
+            continue
+        m = re.search(r"(\S+)\s+and\s+(\S+)\s+are in conflict", line)
+        if m:
+            add(m.group(1))
+            add(m.group(2))
+    return found
+
+
+def extract_dep_conflict_pairs(output: str) -> list[tuple[str, str]]:
+    """(breaker, requirer) pairs from 'breaks dependency' lines.
+
+    ":: installing nvidia-utils (620.73.04-1) breaks dependency
+     'nvidia-utils=620.70.06' required by lib32-nvidia-utils"
+    yields ("nvidia-utils", "lib32-nvidia-utils"): the two are
+    version-locked, so they can only ever move together.
+    """
+    pairs: list[tuple[str, str]] = []
+    for line in (output or "").splitlines():
+        m = re.search(r"installing\s+(\S+)\s*\([^)]*\)\s+breaks dependency\s+"
+                      r"'[^']*'\s+required by\s+(\S+)", line)
+        if m and (m.group(1), m.group(2)) not in pairs:
+            pairs.append((m.group(1), m.group(2)))
+    return pairs
+
+
+def dep_conflict_skip_packages(output: str, selected: list[str]) -> list[str]:
+    """What skipping a dependency conflict must leave out of the retry.
+
+    The breaker always waits. A requirer that was *also* selected waits
+    with it: the pair is version-locked, so updating the requirer alone
+    would fail again against the held-back breaker. An unselected
+    requirer is untouched — it is not part of this run at all.
+    """
+    skip = extract_dep_conflict_packages(output, selected)
+    selected_set = set(selected or [])
+    for _breaker, requirer in extract_dep_conflict_pairs(output):
+        if requirer in selected_set and requirer not in skip:
+            skip.append(requirer)
+    return skip
+
+
+def remaining_after_skip(selected: list[str], skip: list[str]) -> list[str]:
+    """The selected packages that remain once `skip` is left out."""
+    skip_set = set(skip or [])
+    return [name for name in (selected or []) if name not in skip_set]
+
+
 # ── AUR → official move detection ────────────────────────────────────────
 #
 # Packages graduate from the AUR into the official repos. A foreign
@@ -1456,7 +1536,8 @@ _FAILURE_HINTS: list[tuple[str, str, str]] = [
     ("dependency",
      "Dependency conflict",
      "Packages disagree about required versions. See the error details below — "
-     "an obsolete package may be blocking the upgrade."),
+     "an obsolete package may be blocking the upgrade, or skip the "
+     "conflicting packages and update the rest."),
     ("disk-space",
      "Not enough disk space",
      "Free up space (check `paccache -r` to clean the package cache, or "
@@ -1547,6 +1628,50 @@ def _failed_package_names(output: str, candidates: list[str]) -> list[str]:
     for p in pkgs:
         if p in cand and p not in found:
             found.append(p)
+    return found
+
+
+def sync_db_output(names: list[str]) -> str:
+    """Raw `pacman -Si` output for `names` ("" when unavailable).
+
+    Missing targets only cost an error line on stderr: pacman still
+    prints every package it did find, which is all the caller needs.
+    """
+    wanted = [n for n in dict.fromkeys(names or []) if n]
+    if not wanted:
+        return ""
+    try:
+        r = _run(["pacman", "-Si", *wanted],
+                 capture_output=True, text=True, timeout=30)
+    except Exception:
+        return ""
+    return r.stdout or ""
+
+
+def sync_package_names(output: str) -> set[str]:
+    """Package names a sync-DB listing contains (any repo)."""
+    return set(parse_sync_info(output or ""))
+
+
+def sync_dependents(output: str, deps: set[str]) -> list[str]:
+    """Sync packages whose new version depends on any of `deps`.
+
+    Parses `pacman -Si` blocks: a package qualifies when one of its
+    Depends On tokens names the dependency (version pins stripped).
+    """
+    wanted = set(deps or [])
+    if not wanted or not output:
+        return []
+    found: list[str] = []
+    for block in re.split(r"\n\s*\n", output):
+        m = re.search(r"^Name\s*:\s*(\S+)", block, re.MULTILINE)
+        d = re.search(r"^Depends On\s*:\s*(.*?)(?=^\S|\Z)", block,
+                      re.MULTILINE | re.DOTALL)
+        if not m or not d:
+            continue
+        tokens = [re.split(r"[<>=]", t)[0] for t in d.group(1).split()]
+        if wanted.intersection(tokens) and m.group(1) not in found:
+            found.append(m.group(1))
     return found
 
 
@@ -2797,13 +2922,19 @@ class UpdateRunner(QThread):
     done             = pyqtSignal(bool, str)       # success, last output lines
 
     def __init__(self, aur_helper: str | None, packages: list[str] | None = None,
-                 overwrite: str | None = None) -> None:
+                 overwrite: str | None = None,
+                 ignore: list[str] | None = None) -> None:
         super().__init__()
         self._askpass: str | None = None
         self._proc: subprocess.Popen | None = None
         self._killed = False
 
         extra = ["--overwrite", overwrite] if overwrite else []
+        # Skipped packages stay at their current version even when another
+        # package in the transaction would pull their upgrade in.
+        for name in dict.fromkeys(ignore or []):
+            if name:
+                extra += ["--ignore", name]
         # Explicit package lists MUST refresh the sync DBs (-Sy): a bare
         # `-S pkg` installs whatever version the on-disk DBs hold, which
         # silently reinstalls the OLD version when the DBs are stale
@@ -4661,6 +4792,58 @@ class PackageModel(_FilterableModel, QAbstractListModel):
         return [it["name"] for it in self.visible_items()
                 if it["checked"] and not it["compromised"]]
 
+    def check_names(self, names: list[str]) -> None:
+        """Tick the named rows (locked companions joining a retry)."""
+        wanted = set(names or [])
+        if not wanted:
+            return
+        for row, src in enumerate(self._visible):
+            it = self._items[src]
+            if (it["name"] in wanted and not it["checked"]
+                    and not it["compromised"]):
+                it["checked"] = True
+                idx = self.index(row)
+                self.dataChanged.emit(idx, idx,
+                                      [Qt.ItemDataRole.CheckStateRole])
+
+    def include_names(self, names: list[str]) -> list[str]:
+        """Tick the named packages, adding rows for ones not listed yet.
+
+        Returns the names actually ticked (compromised rows never are).
+        Used when a failure shows packages that must join the run —
+        a version-locked companion, or the pair a dependency pulled in.
+        """
+        included: list[str] = []
+        for name in names or []:
+            if name in included:
+                continue
+            it = next((x for x in self._items if x["name"] == name), None)
+            if it is None:
+                it = self.item(self.ensure_row(name))
+            if it.get("compromised"):
+                continue
+            it["checked"] = True
+            included.append(name)
+            r = self.row_of(name)
+            if r is not None:
+                idx = self.index(r)
+                self.dataChanged.emit(idx, idx,
+                                      [Qt.ItemDataRole.CheckStateRole])
+        return included
+
+    def uncheck_names(self, names: list[str]) -> None:
+        """Untick the named rows (skipped packages stay listed, unselected)."""
+        wanted = set(names or [])
+        if not wanted:
+            return
+        for row, src in enumerate(self._visible):
+            it = self._items[src]
+            if it["name"] in wanted and it["checked"]:
+                it["checked"] = False
+                idx = self.index(row)
+                self.dataChanged.emit(idx, idx,
+                                      [Qt.ItemDataRole.CheckStateRole])
+
     def selected_count(self) -> int:
         return sum(1 for it in self.visible_items()
                    if it["checked"] and not it["compromised"])
@@ -6020,6 +6203,13 @@ class UpdateWindow(QMainWindow):
         self._fail_sig: tuple | None = None
         self._fail_streak = 0
         self._offer_open = False
+        # Packages skipped after a failure: left unticked and passed to
+        # the installer as --ignore so the rest can still update.
+        self._ignored_names: set[str] = set()
+        # Packages an automatic retry already added to a run once: if
+        # the run still fails with them in it, they are skipped next
+        # instead of being added again.
+        self._auto_added: set[str] = set()
         # Watchdog: silence from the installer means it may be stuck.
         self._last_activity = 0.0
         self._stuck_warned = False
@@ -7213,6 +7403,8 @@ class UpdateWindow(QMainWindow):
         self._installing_row = None
         self._retry_mode = False
         self._overwrite = None
+        self._ignored_names = set()
+        self._auto_added = set()
         self._fail_sig = None
         self._fail_streak = 0
         self._hide_failure_ui()
@@ -8465,7 +8657,7 @@ class UpdateWindow(QMainWindow):
         """The primary footer button: install what is selected."""
         self.start_update()
 
-    def start_update(self) -> None:
+    def start_update(self, ignore: list[str] | None = None) -> None:
         if self._single is not None:
             self._set_status(
                 "A single-package install is still running — please wait…",
@@ -8485,6 +8677,13 @@ class UpdateWindow(QMainWindow):
         safe_names = self._model.checked_names()
         if not safe_names:
             return
+        if ignore:
+            self._ignored_names.update(ignore)
+        # An explicitly selected package is never ignored: ticking a
+        # skipped row again is how the user asks for it after all, so it
+        # leaves the skip list for good — and is never reported as skipped.
+        self._ignored_names.difference_update(safe_names)
+        effective_ignore = sorted(self._ignored_names)
         self._updating = True
         self._retry_mode = False
         if safe_names != self._last_run_names:
@@ -8528,6 +8727,11 @@ class UpdateWindow(QMainWindow):
             msg = f"Skipping compromised: {skipped}. {msg}"
         if self._overwrite:
             msg += " (retrying with --overwrite)"
+        joined = sorted(self._auto_added.intersection(safe_names))
+        if joined:
+            msg += f" (with: {', '.join(joined)})"
+        if effective_ignore:
+            msg += f" (skipping: {', '.join(effective_ignore)})"
         self._set_status(msg, "info")
         self._set_progress_state("active")
         self._progress.setRange(0, max(n, 1))
@@ -8536,10 +8740,13 @@ class UpdateWindow(QMainWindow):
         self._anim.start()
 
         self._runner = UpdateRunner(
-            self._aur_helper, safe_names, overwrite=self._overwrite)
+            self._aur_helper, safe_names, overwrite=self._overwrite,
+            ignore=effective_ignore or None)
         self._log_action(
             f"Installing {n} update{'s' if n != 1 else ''}: "
-            f"{', '.join(safe_names)}")
+            f"{', '.join(safe_names)}"
+            + (f" (skipping: {', '.join(effective_ignore)})"
+               if effective_ignore else ""))
         self._runner.install_progress.connect(self._on_install_progress)
         self._runner.line.connect(self._on_log_line)
         self._runner.build.connect(self._on_build_started)
@@ -8768,7 +8975,10 @@ class UpdateWindow(QMainWindow):
                 output = ((output + "\n") if output else "") + detail
                 success = False
         if success:
+            skipped_names = sorted(self._ignored_names)
             self._overwrite = None
+            self._ignored_names = set()
+            self._auto_added = set()
             self._fail_sig = None
             self._fail_streak = 0
             _notify_close(self._fail_notif_id)
@@ -8786,18 +8996,25 @@ class UpdateWindow(QMainWindow):
             msg = f"<b>{n_selected} package{'s' if n_selected != 1 else ''}</b> updated"
             if n_comp:
                 msg += f" <span style='color:{_secondary_hex()}'>· {n_comp} compromised skipped</span>"
+            if skipped_names:
+                msg += (f" <span style='color:{_secondary_hex()}'>· "
+                        f"skipped: {', '.join(skipped_names)}</span>")
             msg += f" <span style='color:{_secondary_hex()}'>· closing…</span>"
             self._set_status(msg, "ok")
             subprocess.Popen([
                 "notify-send", "Upkeep Complete",
                 f"Successfully updated {n_selected} package{'s' if n_selected != 1 else ''}."
-                + (f" {n_comp} compromised skipped." if n_comp else ""),
+                + (f" {n_comp} compromised skipped." if n_comp else "")
+                + ((f" Skipped: {', '.join(skipped_names)} "
+                    "(still pending).") if skipped_names else ""),
                 "-i", "system-software-update", "-t", "9000",
             ])
             self.update_succeeded.emit()
             self._log_action(
                 f"Updated {n_selected} package"
-                f"{'s' if n_selected != 1 else ''} ✓")
+                f"{'s' if n_selected != 1 else ''} ✓"
+                + (f" (skipped: {', '.join(skipped_names)})"
+                   if skipped_names else ""))
             # A removal the user queued during the update runs now, and it
             # needs the window to stay: closing stops the runners.
             if not self._drain_pending_removals():
@@ -8842,6 +9059,12 @@ class UpdateWindow(QMainWindow):
         self._release_thread("_runner")
         self._retry_mode = True
         self._watchdog.stop()
+
+        # Seamless path: a dependency conflict is structural, so retrying
+        # the same set can only fail again. Drop the blockers (or pull in
+        # their locked companions) and rerun the rest without asking.
+        if self._auto_retry_dependency_failure(kind, output):
+            return
 
         # Name the failing packages even when they were never in the list
         # (dependencies): give them rows + Retry pills so the failure has
@@ -8960,16 +9183,184 @@ class UpdateWindow(QMainWindow):
             return  # single-flight: never stack modal fix dialogs
         self._offer_open = True
         try:
-            self._maybe_offer_obsolete_cleanup(output)
-            self._maybe_offer_overwrite_retry(kind, output)
+            if not self._maybe_offer_obsolete_cleanup(output):
+                if not self._maybe_offer_overwrite_retry(kind, output):
+                    self._maybe_offer_skip_retry(kind, output)
         finally:
             self._offer_open = False
 
+    def _auto_retry_dependency_failure(self, kind: str,
+                                       output: str) -> bool:
+        """Seamlessly rerun a dependency-blocked update without the blocker.
+
+        No dialog: the same selection can only fail the same way, so the
+        run restarts on its own — with the locked companion ticked in if
+        it has a pending update, otherwise with the conflicting packages
+        dropped. Each retry strictly changes the selection (one package
+        in or out), so this always terminates. Returns True when a new
+        run was started.
+        """
+        if kind != "dependency":
+            return False
+        if self._single is not None:
+            return False
+        if self._rechecker is not None and self._rechecker.isRunning():
+            return False
+        if any(getattr(self, attr, None) is not None
+               for attr in ("_lib_uninstaller", "_remover")):
+            return False
+        selected = list(self._safe_names or [])
+        selected_set = set(selected)
+        pairs = extract_dep_conflict_pairs(output)
+        # Packages that can still save this run by joining it: a locked
+        # companion with a pending row, or either half of the pair when
+        # neither was selected (a selected package pulled the breaker
+        # in as a dependency — the real nvidia-utils case). Sync-DB
+        # membership is the gate for names with no row: an AUR-only
+        # blocker like gaze-bin is never added as a target.
+        join: list[str] = []
+        need_sync: list[str] = []
+        for breaker, requirer in pairs:
+            for name in (breaker, requirer):
+                if (name in selected_set or name in join
+                        or name in self._ignored_names
+                        or name in self._auto_added):
+                    continue
+                r = self._model.row_of(name)
+                if r is not None:
+                    if not self._model.item(r).get("compromised"):
+                        join.append(name)
+                elif name not in need_sync:
+                    need_sync.append(name)
+        if need_sync:
+            available = sync_package_names(sync_db_output(need_sync))
+            join.extend(n for n in need_sync if n in available)
+        if join:
+            included = self._model.include_names(join)
+            if included:
+                self._auto_added.update(included)
+                self._refresh_selection_ui()
+                self._log_action(
+                    f"Updating {', '.join(included)} together with the "
+                    "packages that need them — retrying automatically")
+                self.start_update()
+                return self._updating
+        skip = dep_conflict_skip_packages(output, selected)
+        if not skip:
+            skip = _failed_package_names(output, selected)
+        breakers = {breaker for breaker, _r in pairs}
+        if breakers.intersection(self._auto_added):
+            # Joining was already tried: the selected packages whose
+            # upgrade needs the breaker wait with it, so the rest of
+            # the run is finally free to proceed.
+            for name in sync_dependents(sync_db_output(selected),
+                                        breakers):
+                if name in selected_set and name not in skip:
+                    skip.append(name)
+        rest = remaining_after_skip(selected, skip)
+        if not skip or not rest:
+            return False
+        self._model.uncheck_names(skip)
+        self._refresh_selection_ui()
+        self._log_action(
+            f"Skipping {', '.join(skip)} — updating the rest "
+            "automatically")
+        self.start_update(ignore=skip)
+        return self._updating
+
+    def _maybe_offer_skip_retry(self, kind: str, output: str) -> bool:
+        """Offer to skip the packages a failure names and update the rest.
+
+        A version-locked requirer with its own pending update that was
+        not selected (nvidia-utils / lib32-nvidia-utils) gets the better
+        offer first: update the pair together. Returns True when a retry
+        was started. Skipping is only offered when the failure names a
+        proper subset of the run: skipping everything would leave
+        nothing to update.
+        """
+        if kind in ("cancelled", "busy"):
+            return False
+        selected = list(self._safe_names or [])
+        selected_set = set(selected)
+        together: list[str] = []
+        if kind == "dependency":
+            skip = dep_conflict_skip_packages(output, selected)
+            if not skip:
+                skip = _failed_package_names(output, selected)
+            for breaker, requirer in extract_dep_conflict_pairs(output):
+                if breaker not in selected_set or requirer in selected_set:
+                    continue
+                r = self._model.row_of(requirer)
+                if (r is not None
+                        and not self._model.item(r).get("compromised")
+                        and requirer not in together):
+                    together.append(requirer)
+        elif kind == "file-conflict":
+            pkgs, _files = extract_file_conflicts(output or "")
+            skip = [p for p in pkgs if p in selected]
+            if not skip:
+                skip = _failed_package_names(output, selected)
+        else:
+            skip = _failed_package_names(output, selected)
+        rest = remaining_after_skip(selected, skip)
+        if not together and (not skip or not rest):
+            return False
+        if len(selected) < 2 and not together:
+            return False
+        names = "\n".join(f"  • {pkg}" for pkg in skip)
+        box = QMessageBox(self)
+        box.setWindowTitle("Skip the failing packages?")
+        box.setIcon(QMessageBox.Icon.Warning)
+        text = ""
+        if together:
+            both = "\n".join(f"  • {pkg}" for pkg in together)
+            text += (
+                "These packages are version-locked to the failing ones "
+                "and have updates of their own:\n\n"
+                f"{both}\n\n"
+                "Updating them together may let the whole run succeed.\n\n")
+            box.setWindowTitle("Update the locked packages together?")
+        if skip and rest:
+            text += (
+                "Skip these packages and update the rest?\n\n"
+                f"{names}\n\n"
+                f"The other {len(rest)} "
+                f"package{'s' if len(rest) != 1 else ''} "
+                "can still be updated now. The skipped packages stay at "
+                "their current version and can be updated later, once "
+                "the conflict is resolved.")
+        box.setText(text)
+        together_btn = (box.addButton("Update together & retry",
+                                      QMessageBox.ButtonRole.AcceptRole)
+                        if together else None)
+        skip_btn = (box.addButton("Skip & update rest",
+                                  QMessageBox.ButtonRole.ActionRole)
+                    if skip and rest else None)
+        box.addButton("Not Now", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if together_btn is not None and clicked is together_btn:
+            self._model.check_names(together)
+            self._refresh_selection_ui()
+            self._log_action(
+                f"Updating {', '.join(together)} together with the "
+                "failing packages — retrying")
+            self.start_update()
+            return True
+        if skip_btn is None or clicked is not skip_btn:
+            return False
+        self._model.uncheck_names(skip)
+        self._refresh_selection_ui()
+        self._log_action(
+            f"Skipping {', '.join(skip)} — updating the rest")
+        self.start_update(ignore=skip)
+        return True
+
     def _maybe_offer_overwrite_retry(self, kind: str, output: str,
-                                       single_name: str | None = None) -> None:
+                                       single_name: str | None = None) -> bool:
         """Offer 'Retry with --overwrite' for 'exists in filesystem' failures."""
         if kind != "file-conflict":
-            return
+            return False
         pkgs, files = extract_file_conflicts(output)
         shown = "\n".join(f"  • {f}" for f in files[:8])
         if len(files) > 8:
@@ -8993,6 +9384,8 @@ class UpdateWindow(QMainWindow):
             else:
                 self._overwrite = "*"
                 self.start_update()
+            return True
+        return False
 
     # — Show more: unfold the row in place —
     def _on_more_requested(self, row: int) -> None:
@@ -9188,15 +9581,18 @@ class UpdateWindow(QMainWindow):
             self._offer_open = False
         self._drain_pending_removals()
 
-    def _maybe_offer_obsolete_cleanup(self, output: str) -> None:
-        """If the failed update looks blocked by dropped packages, offer to remove them."""
+    def _maybe_offer_obsolete_cleanup(self, output: str) -> bool:
+        """If dropped packages block the update, offer to remove them.
+
+        Returns True when a removal was started (the retry follows it).
+        """
         try:
             obsolete = get_obsolete_packages()
         except Exception:
             obsolete = []
         culprits = obsolete_conflict_culprits(output, obsolete)
         if not culprits:
-            return
+            return False
 
         names = "\n".join(f"  • {pkg}" for pkg in culprits)
         box = QMessageBox(self)
@@ -9214,6 +9610,8 @@ class UpdateWindow(QMainWindow):
         box.exec()
         if box.clickedButton() is remove_btn:
             self._start_obsolete_removal(culprits)
+            return True
+        return False
 
     def _start_obsolete_removal(self, packages: list[str]) -> None:
         force = False

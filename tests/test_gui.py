@@ -159,6 +159,10 @@ def window(qapp, monkeypatch):
     monkeypatch.setattr(app, "_notify_update", lambda *a, **k: 0)
     monkeypatch.setattr(app, "_notify_close", lambda *a, **k: None)
     monkeypatch.setattr(app, "_SourceEnableRunner", FakeSourceEnableRunner)
+    # Neither of these may reach the real system from a test: both read
+    # the pacman databases by forking it. Tests override what they need.
+    monkeypatch.setattr(app, "get_obsolete_packages", lambda: [])
+    monkeypatch.setattr(app, "sync_db_output", lambda names: "")
     w = app.UpdateWindow(_updates(), {}, None)
     w.resize(1280, 800)
     w.show()
@@ -168,6 +172,14 @@ def window(qapp, monkeypatch):
 
 
 class TestWindow:
+    SI_TEXT = ("Name            : konsole\n"
+               "Version         : 2-1\n"
+               "Depends On      : nvidia-utils=620.73.04  glibc\n"
+               "\n"
+               "Name            : kpackage\n"
+               "Version         : 2-1\n"
+               "Depends On      : glibc\n")
+
     def test_builds(self, window):
         assert window._model.rowCount() == 4
         assert window._update_btn.isEnabled()  # 3 of 3 checkable selected
@@ -384,6 +396,188 @@ class TestWindow:
         assert window._model.item(1)["state"] == "failed"
         assert window._model.item(0)["state"] == "idle"
         assert window._update_btn.isEnabled()
+
+    def test_dependency_failure_skip_updates_the_rest(
+            self, window, qapp, monkeypatch):
+        # The reported case: the new konsole breaks a dependency of an
+        # installed package, so the whole transaction is refused. This
+        # must be seamless: no dialog, the blocker is dropped and the
+        # rest restart on their own.
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        window._safe_names = ["konsole", "aur-pkg", "kpackage"]
+        out = (":: installing konsole (2-1) breaks dependency "
+               "'konsole<2' required by gaze-bin\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert _RecordingBox.shown == []  # seamless: nothing to click
+        assert window._updating is True
+        assert window._runner.packages == ["aur-pkg", "kpackage"]
+        assert window._runner.kwargs.get("ignore") == ["konsole"]
+        assert "konsole" not in window._model.checked_names()
+        assert window._safe_names == ["aur-pkg", "kpackage"]
+
+    def test_locked_pair_updates_together_when_requirer_unselected(
+            self, window, qapp, monkeypatch):
+        # nvidia-utils / lib32-nvidia-utils shape: the requirer has its
+        # own pending update but was not ticked, so the pair can still
+        # move — together. Accepting must tick it and retry with both.
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        window._model.uncheck_names(["aur-pkg"])
+        window._safe_names = ["konsole", "kpackage"]
+        out = (":: installing konsole (2-1) breaks dependency "
+               "'konsole<2' required by aur-pkg\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert _RecordingBox.shown == []  # seamless: nothing to click
+        assert window._updating is True
+        assert window._runner.packages == ["konsole", "aur-pkg", "kpackage"]
+        assert "aur-pkg" in window._model.checked_names()
+
+    def test_pulled_breaker_pair_joins_the_run(
+            self, window, qapp, monkeypatch):
+        # The real nvidia case: neither half of the pair was selected —
+        # a kernel module pulled nvidia-utils in, and lib32-nvidia-utils
+        # blocked it. Both exist in the repos, so both join the run.
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        monkeypatch.setattr(
+            app, "sync_db_output",
+            lambda names: "".join(
+                f"Name            : {n}\nVersion         : 620.73.04-1\n\n"
+                for n in ("nvidia-utils", "lib32-nvidia-utils")))
+        window._model.uncheck_names(["aur-pkg"])
+        window._safe_names = ["konsole", "kpackage"]
+        out = (":: installing nvidia-utils (620.73.04-1) breaks dependency "
+               "'nvidia-utils=620.70.06' required by lib32-nvidia-utils\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert _RecordingBox.shown == []
+        assert window._updating is True
+        assert set(window._runner.packages) == {
+            "konsole", "kpackage", "nvidia-utils", "lib32-nvidia-utils"}
+        assert window._auto_added == {
+            "nvidia-utils", "lib32-nvidia-utils"}
+        # The status line names what joined, so the restart is explained.
+        assert "with: lib32-nvidia-utils, nvidia-utils" in window._status_full
+
+    def test_pullers_are_skipped_when_pair_cannot_join(
+            self, window, qapp, monkeypatch):
+        # Joining the pair was already tried and still failed: the
+        # selected packages that depend on the breaker wait with it.
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        monkeypatch.setattr(app, "sync_db_output",
+                            lambda names: TestWindow.SI_TEXT)
+        window._auto_added = {"nvidia-utils", "lib32-nvidia-utils"}
+        window._model.uncheck_names(["aur-pkg"])
+        window._safe_names = ["konsole", "kpackage"]
+        out = (":: installing nvidia-utils (620.73.04-1) breaks dependency "
+               "'nvidia-utils=620.70.06' required by lib32-nvidia-utils\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert _RecordingBox.shown == []
+        assert window._updating is True
+        assert window._runner.packages == ["kpackage"]
+        assert window._runner.kwargs.get("ignore") == ["konsole"]
+
+    def test_locked_pair_chain_together_then_skip(
+            self, window, qapp, monkeypatch):
+        # First failure pulls the companion in; if the pair still cannot
+        # move (repos out of sync), the next failure drops both and the
+        # rest proceed — still without a single dialog.
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        window._model.uncheck_names(["aur-pkg"])
+        window._safe_names = ["konsole", "kpackage"]
+        out = (":: installing konsole (2-1) breaks dependency "
+               "'konsole<2' required by aur-pkg\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert window._runner.packages == ["konsole", "aur-pkg", "kpackage"]
+        window._safe_names = ["konsole", "aur-pkg", "kpackage"]
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert _RecordingBox.shown == []
+        assert window._updating is True
+        assert window._runner.packages == ["kpackage"]
+        assert window._runner.kwargs.get("ignore") == ["aur-pkg", "konsole"]
+
+    def test_locked_pair_both_selected_are_both_skipped(
+            self, window, qapp, monkeypatch):
+        # Both halves selected and still refused (repos out of sync):
+        # skipping only one would fail again on the other, so both wait.
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        window._safe_names = ["konsole", "aur-pkg", "kpackage"]
+        out = (":: installing konsole (2-1) breaks dependency "
+               "'konsole<2' required by aur-pkg\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert window._updating is True
+        assert window._runner.packages == ["kpackage"]
+        assert "konsole" not in window._model.checked_names()
+        assert "aur-pkg" not in window._model.checked_names()
+
+    def test_dependency_failure_with_nothing_left_keeps_everything(
+            self, window, qapp, monkeypatch):
+        # The only selected package is the blocker: skipping it would
+        # leave nothing to install, so the failure stands as reported.
+        window._safe_names = ["konsole"]
+        out = (":: installing konsole (2-1) breaks dependency "
+               "'konsole<2' required by gaze-bin\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert window._updating is False
+        assert "konsole" in window._model.checked_names()
+
+    def test_success_reports_skipped_packages(self, window, monkeypatch):
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
+        window._ignored_names = {"konsole"}
+        window._safe_names = ["aur-pkg", "kpackage"]
+        window._on_update_done(True, "")
+        assert "konsole" in window._status_full
+        assert "skipped" in window._status_full.lower()
+        assert window._ignored_names == set()
+
+    def test_reticking_a_skipped_package_runs_it_again(
+            self, window, qapp, monkeypatch):
+        # The way back: a skipped row stays in the list, so ticking it
+        # again puts it back in the run — and a success must not keep
+        # calling it skipped.
+        monkeypatch.setattr(app, "QMessageBox", _RecordingBox)
+        _RecordingBox.shown = []
+        window._safe_names = ["konsole", "kpackage"]
+        out = (":: installing konsole (2-1) breaks dependency "
+               "'konsole<2' required by gaze-bin\n"
+               "error: failed to prepare transaction "
+               "(could not satisfy dependencies)")
+        window._on_update_done(False, out)
+        qapp.processEvents()
+        assert window._runner.kwargs.get("ignore") == ["konsole"]
+        window._model.check_names(["konsole"])
+        window.start_update()
+        assert window._runner.packages == ["konsole", "aur-pkg", "kpackage"]
+        assert not window._runner.kwargs.get("ignore")
+        monkeypatch.setattr(app, "verify_upgraded", lambda expected: [])
+        window._on_update_done(True, "")
+        assert "konsole" not in window._status_full
+        assert window._ignored_names == set()
 
     def test_unknown_progress_creates_row(self, window):
         n0 = window._model.rowCount()
