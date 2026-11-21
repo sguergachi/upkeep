@@ -397,6 +397,27 @@ class TestWindow:
         assert window._model.item(0)["state"] == "idle"
         assert window._update_btn.isEnabled()
 
+    def test_failure_offer_uses_preloaded_obsolete_list(
+            self, window, qapp, monkeypatch):
+        # get_obsolete_packages used to run here, on the GUI thread, right
+        # after the failure dialog: one pacman fork per foreign package,
+        # ~12s of frozen window — read as a lock-up exactly when the user
+        # had copied the error. The offer must read the preloaded cache.
+        window._obs_names = ["old-pkg"]
+        seen = []
+        monkeypatch.setattr(
+            app, "obsolete_conflict_culprits",
+            lambda out, obsolete: seen.append(list(obsolete)) or [])
+
+        def _must_not_run():
+            raise AssertionError("rescanned obsolete packages on GUI thread")
+
+        monkeypatch.setattr(app, "get_obsolete_packages", _must_not_run)
+        window._safe_names = ["konsole"]
+        window._on_update_done(False, "boom")
+        qapp.processEvents()
+        assert seen == [["old-pkg"]]
+
     def test_dependency_failure_skip_updates_the_rest(
             self, window, qapp, monkeypatch):
         # The reported case: the new konsole breaks a dependency of an

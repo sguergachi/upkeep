@@ -1347,13 +1347,21 @@ def get_obsolete_packages() -> list[str]:
     in_repos = set(r.stdout.split())
 
     env_c = {**os.environ, "LC_ALL": "C"}  # keep pacman -Qi output parseable
+    # One `pacman -Qi` for the whole foreign set, not one per package: a
+    # normal machine has ~50 foreign packages, and ~0.2s of process spawn
+    # each turns this into a ten-second stall wherever it runs.
+    candidates = sorted(installed - in_repos)
+    if not candidates:
+        return []
+    r = _run(
+        ["pacman", "-Qi", *candidates],
+        capture_output=True, text=True, env=env_c,
+    )
     obsolete: list[str] = []
-    for pkg in sorted(installed - in_repos):
-        r = _run(
-            ["pacman", "-Qi", pkg], capture_output=True, text=True, env=env_c
-        )
-        if "Installed as a dependency" in r.stdout:
-            obsolete.append(pkg)
+    for block in (r.stdout or "").split("\n\n"):
+        m = re.search(r"^Name\s*:\s*(\S+)", block, re.M)
+        if m and "Installed as a dependency" in block:
+            obsolete.append(m.group(1))
     return obsolete
 
 
@@ -9586,10 +9594,14 @@ class UpdateWindow(QMainWindow):
 
         Returns True when a removal was started (the retry follows it).
         """
-        try:
-            obsolete = get_obsolete_packages()
-        except Exception:
-            obsolete = []
+        # Use the list the startup preload already filled in (_obs_names).
+        # Never scan here: this runs on the GUI thread right after the
+        # failure dialog closes, and a fresh scan forks pacman once per
+        # foreign package — the window goes unresponsive for ~12s, which
+        # reads as a lock-up exactly when the user has just copied the
+        # error. If the preload has not finished, skip the offer; the
+        # header's Obsolete tab still carries the list.
+        obsolete = list(self._obs_names)
         culprits = obsolete_conflict_culprits(output, obsolete)
         if not culprits:
             return False
