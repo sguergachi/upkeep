@@ -359,7 +359,20 @@ def _icon_svg(accent: str, on_accent: str) -> bytes:
 _INSTALL_RE = re.compile(
     r"\((\d+)/(\d+)\)\s+(?:installing|upgrading|reinstalling)\s+(\S+)"
 )
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# CSI (colours, cursor, …) and OSC (hyperlinks, titles) — gcc 16 emits OSC 8
+# hyperlinks around warning URLs; leaving them in produces garbage in the log.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"          # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC, BEL or ST terminated
+    r"|\x1b[@-Z\\-_]"                    # single-char escapes
+)
+
+
+def strip_ansi(text: str) -> str:
+    """Remove terminal escape sequences from installer/build output."""
+    if not text:
+        return ""
+    return _ANSI_RE.sub("", text)
 
 # AUR build lines (paru/yay shell out to makepkg, which prints these).
 # paru splits mixed repo+AUR jobs into separate transactions and builds
@@ -1347,13 +1360,21 @@ def get_obsolete_packages() -> list[str]:
     in_repos = set(r.stdout.split())
 
     env_c = {**os.environ, "LC_ALL": "C"}  # keep pacman -Qi output parseable
+    # One `pacman -Qi` for the whole foreign set, not one per package: a
+    # normal machine has ~50 foreign packages, and ~0.2s of process spawn
+    # each turns this into a ten-second stall wherever it runs.
+    candidates = sorted(installed - in_repos)
+    if not candidates:
+        return []
+    r = _run(
+        ["pacman", "-Qi", *candidates],
+        capture_output=True, text=True, env=env_c,
+    )
     obsolete: list[str] = []
-    for pkg in sorted(installed - in_repos):
-        r = _run(
-            ["pacman", "-Qi", pkg], capture_output=True, text=True, env=env_c
-        )
-        if "Installed as a dependency" in r.stdout:
-            obsolete.append(pkg)
+    for block in (r.stdout or "").split("\n\n"):
+        m = re.search(r"^Name\s*:\s*(\S+)", block, re.M)
+        if m and "Installed as a dependency" in block:
+            obsolete.append(m.group(1))
     return obsolete
 
 
@@ -1631,18 +1652,20 @@ def _failed_package_names(output: str, candidates: list[str]) -> list[str]:
     return found
 
 
-def sync_db_output(names: list[str]) -> str:
+def sync_db_output(names: list[str], timeout: int = 10) -> str:
     """Raw `pacman -Si` output for `names` ("" when unavailable).
 
     Missing targets only cost an error line on stderr: pacman still
     prints every package it did find, which is all the caller needs.
+    Best-effort: on timeout/error return "", so callers never block the
+    GUI thread indefinitely during failure recovery.
     """
     wanted = [n for n in dict.fromkeys(names or []) if n]
     if not wanted:
         return ""
     try:
         r = _run(["pacman", "-Si", *wanted],
-                 capture_output=True, text=True, timeout=30)
+                 capture_output=True, text=True, timeout=timeout)
     except Exception:
         return ""
     return r.stdout or ""
@@ -2429,7 +2452,7 @@ class FlatpakRemover(QThread):
                 while "\n" in buf:
                     raw, buf = buf.split("\n", 1)
                     for fragment in raw.split("\r"):
-                        fragment = _ANSI_RE.sub("", fragment).strip()
+                        fragment = strip_ansi(fragment).strip()
                         if fragment:
                             lines.append(fragment)
                             self.line.emit(fragment)
@@ -3010,7 +3033,7 @@ class UpdateRunner(QThread):
                 while "\n" in buf:
                     raw, buf = buf.split("\n", 1)
                     for fragment in raw.split("\r"):
-                        fragment = _ANSI_RE.sub("", fragment).strip()
+                        fragment = strip_ansi(fragment).strip()
                         if not fragment:
                             continue
                         lines.append(fragment)
@@ -3143,7 +3166,7 @@ class ObsoleteRemover(QThread):
                 while "\n" in buf:
                     raw, buf = buf.split("\n", 1)
                     for fragment in raw.split("\r"):
-                        fragment = _ANSI_RE.sub("", fragment).strip()
+                        fragment = strip_ansi(fragment).strip()
                         if fragment:
                             lines.append(fragment)
             elif proc.poll() is not None:
@@ -6171,6 +6194,7 @@ class UpdateWindow(QMainWindow):
         self._done_names: set[str] = set()  # own honest completion tracking
         self._live_conflicts: dict[str, list[str]] = {}
         self._seen_building: set[str] = set()
+        self._aur_total = 0  # AUR packages in the current update run
         self._updating   = False
         self._retry_mode = False
         self._overwrite:  str | None = None
@@ -7530,11 +7554,13 @@ class UpdateWindow(QMainWindow):
 
     # ── Obsolete view ────────────────────────────────────────────────────────
     def _refresh_obsolete_view(self) -> None:
-        try:
-            names = get_obsolete_packages()
-        except Exception:
-            names = []
-        self._fill_obsolete_view(names)
+        """Rescan the obsolete list without blocking the GUI thread.
+
+        Kept as a convenience entry point; the actual scan runs in the
+        background like every other list load.
+        """
+        self._obs_loaded = False
+        self._load_obsolete_async()
 
     def _refresh_obsolete(self) -> None:
         """Rescan for packages no repository provides (never on this thread)."""
@@ -8704,6 +8730,7 @@ class UpdateWindow(QMainWindow):
         self._done_names = set()
         self._live_conflicts = {}
         self._seen_building = set()
+        self._aur_total = 0
         if self._log_view.toPlainText().strip():
             self._log_view.appendPlainText("── New run ──")
             self._refresh_log_empty()
@@ -8716,6 +8743,9 @@ class UpdateWindow(QMainWindow):
 
         comp_pkgs = [p for p in self._updates if p.get("compromised")]
         self._safe_names = safe_names
+        aur_set = {p.get("name", "") for p in self._updates
+                   if p.get("repo") == "aur"}
+        self._aur_total = sum(1 for n in safe_names if n in aur_set)
 
         n = len(safe_names)
         self._stat_ready.set_value(str(n))
@@ -8810,8 +8840,13 @@ class UpdateWindow(QMainWindow):
             return
         self._seen_building.add(pkg)
         r = self._model.ensure_row(pkg)
+        aur_count = ""
+        if self._aur_total > 0:
+            aur_count = (f"AUR {len(self._seen_building)} of "
+                         f"{self._aur_total} · ")
         self._set_status(
-            f"Building AUR package <b>{pkg}</b> — {self._progress_phrase()} "
+            f"Building AUR package <b>{pkg}</b> — "
+            f"{aur_count}{self._progress_phrase()} "
             f"<span style='color:{_secondary_hex()}'>"
             f"(builds report no count)</span>")
         self._model.set_state(pkg, "installing")
@@ -8837,6 +8872,7 @@ class UpdateWindow(QMainWindow):
     # — Live log window: every action the app takes lands here —
     def _on_log_line(self, line: str) -> None:
         self._note_activity()
+        line = strip_ansi(line)
         if is_log_noise(line):
             return
         if not self._log_has_content:
@@ -8975,7 +9011,39 @@ class UpdateWindow(QMainWindow):
                 output = ((output + "\n") if output else "") + detail
                 success = False
         if success:
-            skipped_names = sorted(self._ignored_names)
+            # Packages we asked pacman to ignore — but a build/runtime dep
+            # of something else in the run may have installed them anyway.
+            # Only report those still behind; never claim "pending" falsely.
+            ignored = sorted(self._ignored_names)
+            target_by_name = {p.get("name", ""): p.get("new", "")
+                              for p in self._updates}
+            # Fall back to model rows for targets (covers rows not in the
+            # original updates snapshot).
+            for r in range(self._model.rowCount()):
+                it = self._model.item(r)
+                if it.get("name") and it.get("new") and it["name"] not in target_by_name:
+                    target_by_name[it["name"]] = it["new"]
+            expected_skipped = {n: target_by_name[n] for n in ignored
+                                if target_by_name.get(n)}
+            still_behind = set()
+            if expected_skipped:
+                try:
+                    r = _run(["pacman", "-Q", *expected_skipped],
+                             capture_output=True, text=True, timeout=10)
+                    installed = {}
+                    for line in (r.stdout or "").splitlines():
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            installed[parts[0]] = parts[1]
+                    for n, v in expected_skipped.items():
+                        if installed.get(n) != v:
+                            still_behind.add(n)
+                except Exception:
+                    # Cannot verify — assume still pending rather than
+                    # falsely reporting them as resolved.
+                    still_behind = set(expected_skipped)
+            unknown = [n for n in ignored if n not in expected_skipped]
+            skipped_names = sorted(still_behind | set(unknown))
             self._overwrite = None
             self._ignored_names = set()
             self._auto_added = set()
@@ -8998,27 +9066,24 @@ class UpdateWindow(QMainWindow):
                 msg += f" <span style='color:{_secondary_hex()}'>· {n_comp} compromised skipped</span>"
             if skipped_names:
                 msg += (f" <span style='color:{_secondary_hex()}'>· "
-                        f"skipped: {', '.join(skipped_names)}</span>")
-            msg += f" <span style='color:{_secondary_hex()}'>· closing…</span>"
+                        f"still pending: {', '.join(skipped_names)}</span>")
             self._set_status(msg, "ok")
             subprocess.Popen([
                 "notify-send", "Upkeep Complete",
                 f"Successfully updated {n_selected} package{'s' if n_selected != 1 else ''}."
                 + (f" {n_comp} compromised skipped." if n_comp else "")
-                + ((f" Skipped: {', '.join(skipped_names)} "
-                    "(still pending).") if skipped_names else ""),
+                + ((f" Still pending: {', '.join(skipped_names)}.") if skipped_names else ""),
                 "-i", "system-software-update", "-t", "9000",
             ])
             self.update_succeeded.emit()
             self._log_action(
                 f"Updated {n_selected} package"
                 f"{'s' if n_selected != 1 else ''} ✓"
-                + (f" (skipped: {', '.join(skipped_names)})"
+                + (f" (still pending: {', '.join(skipped_names)})"
                    if skipped_names else ""))
-            # A removal the user queued during the update runs now, and it
-            # needs the window to stay: closing stops the runners.
-            if not self._drain_pending_removals():
-                QTimer.singleShot(2000, self.close)
+            # Keep the window open so the result stays visible; the user
+            # can close it when ready. Queued removals also need it alive.
+            self._drain_pending_removals()
             return
 
         # ── Failure path ──────────────────────────────────────────────
@@ -9105,11 +9170,7 @@ class UpdateWindow(QMainWindow):
         sig = (kind, tuple(failed_names))
         self._fail_streak = self._fail_streak + 1 if sig == self._fail_sig else 1
         self._fail_sig = sig
-        manual_cmd = ""
-        if failed_names:
-            manual_cmd = (
-                "Manual fix (run in a terminal):\n"
-                f"  sudo pacman -S {' '.join(failed_names)} --overwrite '*'\n\n")
+        manual_cmd = self._manual_fix_command(kind, failed_names, output)
         if self._fail_streak >= 2 and kind != "cancelled":
             advice += (f" This exact failure happened {self._fail_streak} "
                        f"times in a row — automatic fixes are paused.")
@@ -9188,6 +9249,62 @@ class UpdateWindow(QMainWindow):
                     self._maybe_offer_skip_retry(kind, output)
         finally:
             self._offer_open = False
+
+    def _manual_fix_command(self, kind: str, failed_names: list[str],
+                            output: str) -> str:
+        """A copy-paste command for a failure the app could not resolve.
+
+        Tailored per failure kind: --overwrite only for file conflicts,
+        never for dependency or version issues (where it changes nothing
+        and misleads).
+        """
+        if not failed_names or kind == "cancelled":
+            return ""
+        names = " ".join(failed_names)
+        header = "Manual fix (run in a terminal):\n"
+        if kind == "file-conflict":
+            cmd = f"sudo pacman -S {names} --overwrite '*'"
+            note = ""
+        elif kind == "dependency":
+            # Include version-locked companions the user may need to move
+            # together (e.g. kernel + nvidia-open, or a pinner that has
+            # its own pending update).
+            extras: list[str] = []
+            selected = set(self._safe_names or [])
+            for breaker, requirer in extract_dep_conflict_pairs(output):
+                for n in (breaker, requirer):
+                    if n not in failed_names and n not in extras:
+                        extras.append(n)
+            together = names + (" " + " ".join(extras) if extras else "")
+            cmd = f"sudo pacman -S {together}"
+            note = (
+                "\n"
+                "# If this is a version-locked pair (kernel/modules, "
+                "nvidia-utils and lib32-nvidia-utils), move them "
+                "together. If the package is provided by more than one "
+                "repo and the wrong one is chosen, name the repo "
+                "explicitly, e.g. extra/nvidia-utils.\n"
+            )
+        elif kind == "signature":
+            cmd = "sudo pacman -Sy archlinux-keyring && sudo pacman -Syu"
+            note = ""
+        elif kind == "sync":
+            cmd = "sudo pacman -Syu"
+            note = ""
+        elif kind == "disk-space":
+            cmd = "sudo paccache -r && sudo pacman -Syu"
+            note = ""
+        elif kind == "stale-db":
+            cmd = "sudo pacman -Syu"
+            note = ""
+        elif kind == "busy":
+            cmd = ("# Wait for the other package manager to finish, then:\n"
+                   f"sudo pacman -S {names}")
+            return header + cmd + "\n\n"
+        else:
+            cmd = f"sudo pacman -S {names}"
+            note = ""
+        return header + f"  {cmd}{note}\n"
 
     def _auto_retry_dependency_failure(self, kind: str,
                                        output: str) -> bool:
@@ -9586,10 +9703,14 @@ class UpdateWindow(QMainWindow):
 
         Returns True when a removal was started (the retry follows it).
         """
-        try:
-            obsolete = get_obsolete_packages()
-        except Exception:
-            obsolete = []
+        # Use the list the startup preload already filled in (_obs_names).
+        # Never scan here: this runs on the GUI thread right after the
+        # failure dialog closes, and a fresh scan forks pacman once per
+        # foreign package — the window goes unresponsive for ~12s, which
+        # reads as a lock-up exactly when the user has just copied the
+        # error. If the preload has not finished, skip the offer; the
+        # header's Obsolete tab still carries the list.
+        obsolete = list(self._obs_names)
         culprits = obsolete_conflict_culprits(output, obsolete)
         if not culprits:
             return False
@@ -9967,7 +10088,7 @@ class _SourceEnableRunner(QThread):
                     while "\n" in buf:
                         raw, buf = buf.split("\n", 1)
                         for fragment in raw.split("\r"):
-                            fragment = _ANSI_RE.sub("", fragment).strip()
+                            fragment = strip_ansi(fragment).strip()
                             if fragment:
                                 lines.append(fragment)
                                 self.line.emit(fragment)

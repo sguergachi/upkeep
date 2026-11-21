@@ -1354,3 +1354,71 @@ class TestDesktopLaunch:
                             lambda p: p == str(doc) if "doc" in p else False)
         # No by-app under it → the portal is not providing anything.
         assert app.flatpak_portal_missing() is True
+
+
+class TestGetObsoletePackages:
+    """One `pacman -Qi` for the whole foreign set, not one per package."""
+
+    class _R:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout, self.returncode = stdout, returncode
+
+    def test_parses_install_reason_from_a_single_qi(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:2] == ["pacman", "-Qq"]:
+                return self._R("a\nb\nc\nd\n")
+            if cmd[:2] == ["pacman", "-Slq"]:
+                return self._R("a\nb\n")
+            if cmd[:2] == ["pacman", "-Qi"]:
+                return self._R(
+                    "Name            : c\n"
+                    "Install Reason  : Installed as a dependency for "
+                    "another package\n"
+                    "\n"
+                    "Name            : d\n"
+                    "Install Reason  : Explicitly installed\n")
+            raise AssertionError(f"unexpected call: {cmd}")
+
+        monkeypatch.setattr(app, "_run", fake_run)
+        assert app.get_obsolete_packages() == ["c"]
+        qi = [c for c in calls if c[:2] == ["pacman", "-Qi"]]
+        assert qi == [["pacman", "-Qi", "c", "d"]]
+
+    def test_no_qi_when_every_package_is_in_a_repo(self, monkeypatch):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:2] == ["pacman", "-Qq"]:
+                return self._R("a\n")
+            if cmd[:2] == ["pacman", "-Slq"]:
+                return self._R("a\n")
+            raise AssertionError(f"unexpected call: {cmd}")
+
+        monkeypatch.setattr(app, "_run", fake_run)
+        assert app.get_obsolete_packages() == []
+        assert [c for c in calls if c[:2] == ["pacman", "-Qi"]] == []
+
+
+class TestStripAnsi:
+    def test_strips_csi_color_codes(self):
+        assert app.strip_ansi("\x1b[31mred\x1b[0m") == "red"
+
+    def test_strips_osc8_hyperlink_bel(self):
+        # gcc -fdiagnostics-urls: hyperlink wraps the URL text
+        s = "\x1b]8;;https://gcc.gnu.org/onlinedocs\x07URL\x1b]8;;\x07"
+        assert app.strip_ansi(s) == "URL"
+
+    def test_strips_osc8_hyperlink_st(self):
+        s = "\x1b]8;;https://example.com\x1b\\text\x1b]8;;\x1b\\"
+        assert app.strip_ansi(s) == "text"
+
+    def test_plain_text_unchanged(self):
+        assert app.strip_ansi("no escapes here") == "no escapes here"
+
+    def test_empty(self):
+        assert app.strip_ansi("") == ""
+        assert app.strip_ansi(None) == ""
